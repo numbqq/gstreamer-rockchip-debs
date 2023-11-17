@@ -1,0 +1,10 @@
+This is a GStreamer plugin for Edge2.
+
+It is based on the following plugins:
+
+gstreamer1.0-rockchip1_1.14-6_arm64
+├─usr
+|  ├─share
+|  ├─lib
+|  |  ├─aarch64-linux-gnu
+|  |  |         ├─gstreamer-1.0  # all sync from rockchipSDK/debian/packages/arm64/gst-rkmpp/gstreamer1.0-rockchip1_1.14-4_arm64.deb
