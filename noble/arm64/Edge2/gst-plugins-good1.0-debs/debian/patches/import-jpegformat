@@ -1,0 +1,2075 @@
+From: Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
+Date: Tue, 1 Feb 2022 14:56:55 -0500
+Subject: This is a copy of the jpegformat plugin from gst-plugins-good. It's
+ needed for Ubuntu main, so we copy it.
+
+===================================================================
+---
+ gst/jpegformat/gstjifmux.c     | 759 ++++++++++++++++++++++++++++++++++
+ gst/jpegformat/gstjifmux.h     |  68 ++++
+ gst/jpegformat/gstjpegformat.c |  45 ++
+ gst/jpegformat/gstjpegformat.h |  92 +++++
+ gst/jpegformat/gstjpegparse.c  | 901 +++++++++++++++++++++++++++++++++++++++++
+ gst/jpegformat/gstjpegparse.h  |  94 +++++
+ gst/jpegformat/meson.build     |  16 +
+ gst/meson.build                |   2 +-
+ meson_options.txt              |   2 +
+ 9 files changed, 1978 insertions(+), 1 deletion(-)
+ create mode 100644 gst/jpegformat/gstjifmux.c
+ create mode 100644 gst/jpegformat/gstjifmux.h
+ create mode 100644 gst/jpegformat/gstjpegformat.c
+ create mode 100644 gst/jpegformat/gstjpegformat.h
+ create mode 100644 gst/jpegformat/gstjpegparse.c
+ create mode 100644 gst/jpegformat/gstjpegparse.h
+ create mode 100644 gst/jpegformat/meson.build
+
+diff --git a/gst/jpegformat/gstjifmux.c b/gst/jpegformat/gstjifmux.c
+new file mode 100644
+index 0000000..79241bb
+--- /dev/null
++++ b/gst/jpegformat/gstjifmux.c
+@@ -0,0 +1,759 @@
++/* GStreamer
++ *
++ * jifmux: JPEG interchange format muxer
++ *
++ * Copyright (C) 2010 Stefan Kost <stefan.kost@nokia.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++/**
++ * SECTION:element-jifmux
++ * @title: jifmux
++ * @short_description: JPEG interchange format writer
++ *
++ * Writes a JPEG image as JPEG/EXIF or JPEG/JFIF including various metadata. The
++ * jpeg image received on the sink pad should be minimal (e.g. should not
++ * contain metadata already).
++ *
++ * ## Example launch line
++ * |[
++ * gst-launch-1.0 -v videotestsrc num-buffers=1 ! jpegenc ! jifmux ! filesink location=...
++ * ]|
++ * The above pipeline renders a frame, encodes to jpeg, adds metadata and writes
++ * it to disk.
++ *
++ */
++/*
++jpeg interchange format:
++file header : SOI, APPn{JFIF,EXIF,...}
++frame header: DQT, SOF
++scan header : {DAC,DHT},DRI,SOS
++<scan data>
++file trailer: EOI
++
++tests:
++gst-launch-1.0 videotestsrc num-buffers=1 ! jpegenc ! jifmux ! filesink location=test1.jpeg
++gst-launch-1.0 videotestsrc num-buffers=1 ! jpegenc ! taginject tags="comment=test image" ! jifmux ! filesink location=test2.jpeg
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <string.h>
++#include <gst/base/gstbytereader.h>
++#include <gst/base/gstbytewriter.h>
++#include <gst/tag/tag.h>
++#include <gst/tag/xmpwriter.h>
++
++#include "gstjifmux.h"
++
++static GstStaticPadTemplate gst_jif_mux_src_pad_template =
++GST_STATIC_PAD_TEMPLATE ("src",
++    GST_PAD_SRC,
++    GST_PAD_ALWAYS,
++    GST_STATIC_CAPS ("image/jpeg")
++    );
++
++static GstStaticPadTemplate gst_jif_mux_sink_pad_template =
++GST_STATIC_PAD_TEMPLATE ("sink",
++    GST_PAD_SINK,
++    GST_PAD_ALWAYS,
++    GST_STATIC_CAPS ("image/jpeg")
++    );
++
++GST_DEBUG_CATEGORY_STATIC (jif_mux_debug);
++#define GST_CAT_DEFAULT jif_mux_debug
++
++#define COLORSPACE_UNKNOWN         (0 << 0)
++#define COLORSPACE_GRAYSCALE       (1 << 0)
++#define COLORSPACE_YUV             (1 << 1)
++#define COLORSPACE_RGB             (1 << 2)
++#define COLORSPACE_CMYK            (1 << 3)
++#define COLORSPACE_YCCK            (1 << 4)
++
++typedef struct _GstJifMuxMarker
++{
++  guint8 marker;
++  guint16 size;
++
++  const guint8 *data;
++  gboolean owned;
++} GstJifMuxMarker;
++
++static void gst_jif_mux_finalize (GObject * object);
++
++static void gst_jif_mux_reset (GstJifMux * self);
++static gboolean gst_jif_mux_sink_setcaps (GstJifMux * self, GstCaps * caps);
++static gboolean gst_jif_mux_sink_event (GstPad * pad, GstObject * parent,
++    GstEvent * event);
++static GstFlowReturn gst_jif_mux_chain (GstPad * pad, GstObject * parent,
++    GstBuffer * buffer);
++static GstStateChangeReturn gst_jif_mux_change_state (GstElement * element,
++    GstStateChange transition);
++
++#define gst_jif_mux_parent_class parent_class
++G_DEFINE_TYPE_WITH_CODE (GstJifMux, gst_jif_mux, GST_TYPE_ELEMENT,
++    G_IMPLEMENT_INTERFACE (GST_TYPE_TAG_SETTER, NULL);
++    G_IMPLEMENT_INTERFACE (GST_TYPE_TAG_XMP_WRITER, NULL));
++GST_ELEMENT_REGISTER_DEFINE (jifmux, "jifmux", GST_RANK_SECONDARY,
++    GST_TYPE_JIF_MUX);
++
++static void
++gst_jif_mux_class_init (GstJifMuxClass * klass)
++{
++  GObjectClass *gobject_class;
++  GstElementClass *gstelement_class;
++
++  gobject_class = (GObjectClass *) klass;
++  gstelement_class = (GstElementClass *) klass;
++
++  gobject_class->finalize = gst_jif_mux_finalize;
++
++  gstelement_class->change_state = GST_DEBUG_FUNCPTR (gst_jif_mux_change_state);
++
++  gst_element_class_add_static_pad_template (gstelement_class,
++      &gst_jif_mux_src_pad_template);
++  gst_element_class_add_static_pad_template (gstelement_class,
++      &gst_jif_mux_sink_pad_template);
++
++  gst_element_class_set_static_metadata (gstelement_class,
++      "JPEG stream muxer",
++      "Video/Formatter",
++      "Remuxes JPEG images with markers and tags",
++      "Arnout Vandecappelle (Essensium/Mind) <arnout@mind.be>");
++
++  GST_DEBUG_CATEGORY_INIT (jif_mux_debug, "jifmux", 0,
++      "JPEG interchange format muxer");
++}
++
++static void
++gst_jif_mux_init (GstJifMux * self)
++{
++  GstPad *sinkpad;
++
++  /* create the sink and src pads */
++  sinkpad = gst_pad_new_from_static_template (&gst_jif_mux_sink_pad_template,
++      "sink");
++  gst_pad_set_chain_function (sinkpad, GST_DEBUG_FUNCPTR (gst_jif_mux_chain));
++  gst_pad_set_event_function (sinkpad,
++      GST_DEBUG_FUNCPTR (gst_jif_mux_sink_event));
++  gst_element_add_pad (GST_ELEMENT (self), sinkpad);
++
++  self->srcpad =
++      gst_pad_new_from_static_template (&gst_jif_mux_src_pad_template, "src");
++  gst_element_add_pad (GST_ELEMENT (self), self->srcpad);
++}
++
++static void
++gst_jif_mux_finalize (GObject * object)
++{
++  GstJifMux *self = GST_JIF_MUX (object);
++
++  gst_jif_mux_reset (self);
++  G_OBJECT_CLASS (parent_class)->finalize (object);
++}
++
++static gboolean
++gst_jif_mux_sink_setcaps (GstJifMux * self, GstCaps * caps)
++{
++  GstStructure *s = gst_caps_get_structure (caps, 0);
++  const gchar *variant;
++
++  /* should be {combined (default), EXIF, JFIF} */
++  if ((variant = gst_structure_get_string (s, "variant")) != NULL) {
++    GST_INFO_OBJECT (self, "muxing to '%s'", variant);
++    /* FIXME: do we want to switch it like this or use a gobject property ? */
++  }
++
++  return gst_pad_set_caps (self->srcpad, caps);
++}
++
++static gboolean
++gst_jif_mux_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
++{
++  GstJifMux *self = GST_JIF_MUX (parent);
++  gboolean ret;
++
++  switch (GST_EVENT_TYPE (event)) {
++    case GST_EVENT_CAPS:
++    {
++      GstCaps *caps;
++
++      gst_event_parse_caps (event, &caps);
++      ret = gst_jif_mux_sink_setcaps (self, caps);
++      gst_event_unref (event);
++      break;
++    }
++    case GST_EVENT_TAG:{
++      GstTagList *list;
++      GstTagSetter *setter = GST_TAG_SETTER (self);
++      const GstTagMergeMode mode = gst_tag_setter_get_tag_merge_mode (setter);
++
++      gst_event_parse_tag (event, &list);
++
++      gst_tag_setter_merge_tags (setter, list, mode);
++
++      ret = gst_pad_event_default (pad, parent, event);
++      break;
++    }
++    default:
++      ret = gst_pad_event_default (pad, parent, event);
++      break;
++  }
++  return ret;
++}
++
++static void
++gst_jif_mux_marker_free (GstJifMuxMarker * m)
++{
++  if (m->owned)
++    g_free ((gpointer) m->data);
++
++  g_slice_free (GstJifMuxMarker, m);
++}
++
++static void
++gst_jif_mux_reset (GstJifMux * self)
++{
++  GList *node;
++  GstJifMuxMarker *m;
++
++  for (node = self->markers; node; node = g_list_next (node)) {
++    m = (GstJifMuxMarker *) node->data;
++    gst_jif_mux_marker_free (m);
++  }
++  g_list_free (self->markers);
++  self->markers = NULL;
++}
++
++static GstJifMuxMarker *
++gst_jif_mux_new_marker (guint8 marker, guint16 size, const guint8 * data,
++    gboolean owned)
++{
++  GstJifMuxMarker *m = g_slice_new (GstJifMuxMarker);
++
++  m->marker = marker;
++  m->size = size;
++  m->data = data;
++  m->owned = owned;
++
++  return m;
++}
++
++static gboolean
++gst_jif_mux_parse_image (GstJifMux * self, GstBuffer * buf)
++{
++  GstByteReader reader;
++  GstJifMuxMarker *m;
++  guint8 marker = 0;
++  guint16 size = 0;
++  const guint8 *data = NULL;
++  GstMapInfo map;
++
++  gst_buffer_map (buf, &map, GST_MAP_READ);
++  gst_byte_reader_init (&reader, map.data, map.size);
++
++  GST_LOG_OBJECT (self, "Received buffer of size: %" G_GSIZE_FORMAT, map.size);
++
++  if (!gst_byte_reader_peek_uint8 (&reader, &marker))
++    goto error;
++
++  while (marker == 0xff) {
++    if (!gst_byte_reader_skip (&reader, 1))
++      goto error;
++
++    if (!gst_byte_reader_get_uint8 (&reader, &marker))
++      goto error;
++
++    switch (marker) {
++      case RST0:
++      case RST1:
++      case RST2:
++      case RST3:
++      case RST4:
++      case RST5:
++      case RST6:
++      case RST7:
++      case SOI:
++        GST_DEBUG_OBJECT (self, "marker = %x", marker);
++        m = gst_jif_mux_new_marker (marker, 0, NULL, FALSE);
++        self->markers = g_list_prepend (self->markers, m);
++        break;
++      case EOI:
++        GST_DEBUG_OBJECT (self, "marker = %x", marker);
++        m = gst_jif_mux_new_marker (marker, 0, NULL, FALSE);
++        self->markers = g_list_prepend (self->markers, m);
++        goto done;
++      default:
++        if (!gst_byte_reader_get_uint16_be (&reader, &size))
++          goto error;
++        if (!gst_byte_reader_get_data (&reader, size - 2, &data))
++          goto error;
++
++        m = gst_jif_mux_new_marker (marker, size - 2, data, FALSE);
++        self->markers = g_list_prepend (self->markers, m);
++
++        GST_DEBUG_OBJECT (self, "marker = %2x, size = %u", marker, size);
++        break;
++    }
++
++    if (marker == SOS) {
++      gint eoi_pos = -1;
++      gint i;
++
++      /* search the last 5 bytes for the EOI marker */
++      g_assert (map.size >= 5);
++      for (i = 5; i >= 2; i--) {
++        if (map.data[map.size - i] == 0xFF && map.data[map.size - i + 1] == EOI) {
++          eoi_pos = map.size - i;
++          break;
++        }
++      }
++      if (eoi_pos == -1) {
++        GST_WARNING_OBJECT (self, "Couldn't find an EOI marker");
++        eoi_pos = map.size;
++      }
++
++      /* remaining size except EOI is scan data */
++      self->scan_size = eoi_pos - gst_byte_reader_get_pos (&reader);
++      if (!gst_byte_reader_get_data (&reader, self->scan_size,
++              &self->scan_data))
++        goto error;
++
++      GST_DEBUG_OBJECT (self, "scan data, size = %u", self->scan_size);
++    }
++
++    if (!gst_byte_reader_peek_uint8 (&reader, &marker))
++      goto error;
++  }
++  GST_INFO_OBJECT (self, "done parsing at 0x%x / 0x%x",
++      gst_byte_reader_get_pos (&reader), (guint) map.size);
++
++done:
++  self->markers = g_list_reverse (self->markers);
++  gst_buffer_unmap (buf, &map);
++
++  return TRUE;
++
++  /* ERRORS */
++error:
++  {
++    GST_WARNING_OBJECT (self,
++        "Error parsing image header (need more that %u bytes available)",
++        gst_byte_reader_get_remaining (&reader));
++    gst_buffer_unmap (buf, &map);
++    return FALSE;
++  }
++}
++
++static gboolean
++gst_jif_mux_mangle_markers (GstJifMux * self)
++{
++  gboolean modified = FALSE;
++  GstTagList *tags = NULL;
++  gboolean cleanup_tags;
++  GstJifMuxMarker *m;
++  GList *node, *file_hdr = NULL, *frame_hdr = NULL, *scan_hdr = NULL;
++  GList *app0_jfif = NULL, *app1_exif = NULL, *app1_xmp = NULL, *com = NULL;
++  GstBuffer *xmp_data;
++  gchar *str = NULL;
++  gint colorspace = COLORSPACE_UNKNOWN;
++
++  /* update the APP markers
++   * - put any JFIF APP0 first
++   * - the Exif APP1 next,
++   * - the XMP APP1 next,
++   * - the PSIR APP13 next,
++   * - followed by all other marker segments
++   */
++
++  /* find some reference points where we insert before/after */
++  file_hdr = self->markers;
++  for (node = self->markers; node; node = g_list_next (node)) {
++    m = (GstJifMuxMarker *) node->data;
++
++    switch (m->marker) {
++      case APP0:
++        if (m->size > 5 && !memcmp (m->data, "JFIF\0", 5)) {
++          GST_DEBUG_OBJECT (self, "found APP0 JFIF");
++          colorspace |= COLORSPACE_GRAYSCALE | COLORSPACE_YUV;
++          if (!app0_jfif)
++            app0_jfif = node;
++        }
++        break;
++      case APP1:
++        if (m->size > 6 && (!memcmp (m->data, "EXIF\0\0", 6) ||
++                !memcmp (m->data, "Exif\0\0", 6))) {
++          GST_DEBUG_OBJECT (self, "found APP1 EXIF");
++          if (!app1_exif)
++            app1_exif = node;
++        } else if (m->size > 29
++            && !memcmp (m->data, "http://ns.adobe.com/xap/1.0/\0", 29)) {
++          GST_INFO_OBJECT (self, "found APP1 XMP, will be replaced");
++          if (!app1_xmp)
++            app1_xmp = node;
++        }
++        break;
++      case APP14:
++        /* check if this contains RGB */
++        /*
++         * This marker should have:
++         * - 'Adobe\0'
++         * - 2 bytes DCTEncodeVersion
++         * - 2 bytes flags0
++         * - 2 bytes flags1
++         * - 1 byte  ColorTransform
++         *             - 0 means unknown (RGB or CMYK)
++         *             - 1 YCbCr
++         *             - 2 YCCK
++         */
++
++        if ((m->size >= 14)
++            && (strncmp ((gchar *) m->data, "Adobe\0", 6) == 0)) {
++          switch (m->data[11]) {
++            case 0:
++              colorspace |= COLORSPACE_RGB | COLORSPACE_CMYK;
++              break;
++            case 1:
++              colorspace |= COLORSPACE_YUV;
++              break;
++            case 2:
++              colorspace |= COLORSPACE_YCCK;
++              break;
++            default:
++              break;
++          }
++        }
++
++        break;
++      case COM:
++        GST_INFO_OBJECT (self, "found COM, will be replaced");
++        if (!com)
++          com = node;
++        break;
++      case DQT:
++      case SOF0:
++      case SOF1:
++      case SOF2:
++      case SOF3:
++      case SOF5:
++      case SOF6:
++      case SOF7:
++      case SOF9:
++      case SOF10:
++      case SOF11:
++      case SOF13:
++      case SOF14:
++      case SOF15:
++        if (!frame_hdr)
++          frame_hdr = node;
++        break;
++      case DAC:
++      case DHT:
++      case DRI:
++      case SOS:
++        if (!scan_hdr)
++          scan_hdr = node;
++        break;
++    }
++  }
++
++  /* if we want combined or JFIF */
++  /* check if we don't have JFIF APP0 */
++  if (!app0_jfif && (colorspace & (COLORSPACE_GRAYSCALE | COLORSPACE_YUV))) {
++    /* build jfif header */
++    static const struct
++    {
++      gchar id[5];
++      guint8 ver[2];
++      guint8 du;
++      guint8 xd[2], yd[2];
++      guint8 tw, th;
++    } jfif_data = {
++      "JFIF", {
++      1, 2}, 0, {
++      0, 1},                    /* FIXME: check pixel-aspect from caps */
++      {
++    0, 1}, 0, 0};
++    m = gst_jif_mux_new_marker (APP0, sizeof (jfif_data),
++        (const guint8 *) &jfif_data, FALSE);
++    /* insert into self->markers list */
++    self->markers = g_list_insert (self->markers, m, 1);
++    app0_jfif = g_list_nth (self->markers, 1);
++  }
++  /* else */
++  /* remove JFIF if exists */
++
++  /* Existing exif tags will be removed and our own will be added */
++  if (!tags) {
++    tags = (GstTagList *) gst_tag_setter_get_tag_list (GST_TAG_SETTER (self));
++    cleanup_tags = FALSE;
++  }
++  if (!tags) {
++    tags = gst_tag_list_new_empty ();
++    cleanup_tags = TRUE;
++  }
++
++  GST_DEBUG_OBJECT (self, "Tags to be serialized %" GST_PTR_FORMAT, tags);
++
++  /* FIXME: not happy with those
++   * - else where we would use VIDEO_CODEC = "Jpeg"
++   gst_tag_list_add (tags, GST_TAG_MERGE_REPLACE,
++   GST_TAG_VIDEO_CODEC, "image/jpeg", NULL);
++   */
++
++  /* Add EXIF */
++  {
++    GstBuffer *exif_data;
++    gsize exif_size;
++    guint8 *data;
++    GstJifMuxMarker *m;
++    GList *pos;
++
++    /* insert into self->markers list */
++    exif_data = gst_tag_list_to_exif_buffer_with_tiff_header (tags);
++    exif_size = exif_data ? gst_buffer_get_size (exif_data) : 0;
++
++    if (exif_data && exif_size + 8 >= G_GUINT64_CONSTANT (65536)) {
++      GST_WARNING_OBJECT (self, "Exif tags data size exceed maximum size");
++      gst_buffer_unref (exif_data);
++      exif_data = NULL;
++    }
++    if (exif_data) {
++      data = g_malloc0 (exif_size + 6);
++      memcpy (data, "Exif", 4);
++      gst_buffer_extract (exif_data, 0, data + 6, exif_size);
++      m = gst_jif_mux_new_marker (APP1, exif_size + 6, data, TRUE);
++      gst_buffer_unref (exif_data);
++
++      if (app1_exif) {
++        gst_jif_mux_marker_free ((GstJifMuxMarker *) app1_exif->data);
++        app1_exif->data = m;
++      } else {
++        pos = file_hdr;
++        if (app0_jfif)
++          pos = app0_jfif;
++        pos = g_list_next (pos);
++
++        self->markers = g_list_insert_before (self->markers, pos, m);
++        if (pos) {
++          app1_exif = g_list_previous (pos);
++        } else {
++          app1_exif = g_list_last (self->markers);
++        }
++      }
++      modified = TRUE;
++    }
++  }
++
++  /* add xmp */
++  xmp_data =
++      gst_tag_xmp_writer_tag_list_to_xmp_buffer (GST_TAG_XMP_WRITER (self),
++      tags, FALSE);
++  if (xmp_data) {
++    guint8 *data;
++    gsize size;
++    GList *pos;
++
++    size = gst_buffer_get_size (xmp_data);
++    data = g_malloc (size + 29);
++    memcpy (data, "http://ns.adobe.com/xap/1.0/\0", 29);
++    gst_buffer_extract (xmp_data, 0, &data[29], size);
++    m = gst_jif_mux_new_marker (APP1, size + 29, data, TRUE);
++
++    /*
++     * Replace the old xmp marker and not add a new one.
++     * There shouldn't be a xmp packet in the input, but it is better
++     * to be safe than add another one and end up with 2 packets.
++     */
++    if (app1_xmp) {
++      gst_jif_mux_marker_free ((GstJifMuxMarker *) app1_xmp->data);
++      app1_xmp->data = m;
++    } else {
++
++      pos = file_hdr;
++      if (app1_exif)
++        pos = app1_exif;
++      else if (app0_jfif)
++        pos = app0_jfif;
++      pos = g_list_next (pos);
++
++      self->markers = g_list_insert_before (self->markers, pos, m);
++
++    }
++    gst_buffer_unref (xmp_data);
++    modified = TRUE;
++  }
++
++  /* add jpeg comment from any of those */
++  (void) (gst_tag_list_get_string (tags, GST_TAG_COMMENT, &str) ||
++      gst_tag_list_get_string (tags, GST_TAG_DESCRIPTION, &str) ||
++      gst_tag_list_get_string (tags, GST_TAG_TITLE, &str));
++
++  if (str) {
++    GST_DEBUG_OBJECT (self, "set COM marker to '%s'", str);
++    /* insert new marker into self->markers list */
++    m = gst_jif_mux_new_marker (COM, strlen (str) + 1, (const guint8 *) str,
++        TRUE);
++    /* FIXME: if we have one already, replace */
++    /* this should go before SOS, maybe at the end of file-header */
++    self->markers = g_list_insert_before (self->markers, frame_hdr, m);
++
++    modified = TRUE;
++  }
++
++  if (tags && cleanup_tags)
++    gst_tag_list_unref (tags);
++  return modified;
++}
++
++static GstFlowReturn
++gst_jif_mux_recombine_image (GstJifMux * self, GstBuffer ** new_buf,
++    GstBuffer * old_buf)
++{
++  GstBuffer *buf;
++  GstByteWriter *writer;
++  GstJifMuxMarker *m;
++  GList *node;
++  guint size = self->scan_size;
++  gboolean writer_status = TRUE;
++  GstMapInfo map;
++
++  /* iterate list and collect size */
++  for (node = self->markers; node; node = g_list_next (node)) {
++    m = (GstJifMuxMarker *) node->data;
++
++    /* some markers like e.g. SOI are empty */
++    if (m->size) {
++      size += 2 + m->size;
++    }
++    /* 0xff <marker> */
++    size += 2;
++  }
++  GST_INFO_OBJECT (self, "old size: %" G_GSIZE_FORMAT ", new size: %u",
++      gst_buffer_get_size (old_buf), size);
++
++  /* allocate new buffer */
++  buf = gst_buffer_new_allocate (NULL, size, NULL);
++
++  /* copy buffer metadata */
++  gst_buffer_copy_into (buf, old_buf,
++      GST_BUFFER_COPY_FLAGS | GST_BUFFER_COPY_TIMESTAMPS, 0, -1);
++
++  /* memcopy markers */
++  gst_buffer_map (buf, &map, GST_MAP_WRITE);
++  writer = gst_byte_writer_new_with_data (map.data, map.size, TRUE);
++
++  for (node = self->markers; node && writer_status; node = g_list_next (node)) {
++    m = (GstJifMuxMarker *) node->data;
++
++    writer_status &= gst_byte_writer_put_uint8 (writer, 0xff);
++    writer_status &= gst_byte_writer_put_uint8 (writer, m->marker);
++
++    GST_DEBUG_OBJECT (self, "marker = %2x, size = %u", m->marker, m->size + 2);
++
++    if (m->size) {
++      writer_status &= gst_byte_writer_put_uint16_be (writer, m->size + 2);
++      writer_status &= gst_byte_writer_put_data (writer, m->data, m->size);
++    }
++
++    if (m->marker == SOS) {
++      GST_DEBUG_OBJECT (self, "scan data, size = %u", self->scan_size);
++      writer_status &=
++          gst_byte_writer_put_data (writer, self->scan_data, self->scan_size);
++    }
++  }
++  gst_buffer_unmap (buf, &map);
++  gst_byte_writer_free (writer);
++
++  if (!writer_status) {
++    GST_WARNING_OBJECT (self, "Failed to write to buffer, calculated size "
++        "was probably too short");
++    g_assert_not_reached ();
++  }
++
++  *new_buf = buf;
++  return GST_FLOW_OK;
++}
++
++static GstFlowReturn
++gst_jif_mux_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
++{
++  GstJifMux *self = GST_JIF_MUX (parent);
++  GstFlowReturn fret = GST_FLOW_OK;
++
++#if 0
++  GST_MEMDUMP ("jpeg beg", GST_BUFFER_DATA (buf), 64);
++  GST_MEMDUMP ("jpeg end", GST_BUFFER_DATA (buf) + GST_BUFFER_SIZE (buf) - 64,
++      64);
++#endif
++
++  /* we should have received a whole picture from SOI to EOI
++   * build a list of markers */
++  if (gst_jif_mux_parse_image (self, buf)) {
++    /* modify marker list */
++    if (gst_jif_mux_mangle_markers (self)) {
++      /* the list was changed, remux */
++      GstBuffer *old = buf;
++      fret = gst_jif_mux_recombine_image (self, &buf, old);
++      gst_buffer_unref (old);
++    }
++  }
++
++  /* free the marker list */
++  gst_jif_mux_reset (self);
++
++  if (fret == GST_FLOW_OK) {
++    fret = gst_pad_push (self->srcpad, buf);
++  }
++  return fret;
++}
++
++static GstStateChangeReturn
++gst_jif_mux_change_state (GstElement * element, GstStateChange transition)
++{
++  GstStateChangeReturn ret;
++  GstJifMux *self = GST_JIF_MUX_CAST (element);
++
++  switch (transition) {
++    case GST_STATE_CHANGE_NULL_TO_READY:
++      break;
++    case GST_STATE_CHANGE_READY_TO_PAUSED:
++      break;
++    case GST_STATE_CHANGE_PAUSED_TO_PLAYING:
++      break;
++    default:
++      break;
++  }
++
++  ret = GST_ELEMENT_CLASS (parent_class)->change_state (element, transition);
++
++  switch (transition) {
++    case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
++      break;
++    case GST_STATE_CHANGE_PAUSED_TO_READY:
++      gst_tag_setter_reset_tags (GST_TAG_SETTER (self));
++      break;
++    case GST_STATE_CHANGE_READY_TO_NULL:
++      break;
++    default:
++      break;
++  }
++
++  return ret;
++}
+diff --git a/gst/jpegformat/gstjifmux.h b/gst/jpegformat/gstjifmux.h
+new file mode 100644
+index 0000000..96830bb
+--- /dev/null
++++ b/gst/jpegformat/gstjifmux.h
+@@ -0,0 +1,68 @@
++/* GStreamer
++ *
++ * jifmux: JPEG interchange format muxer
++ *
++ * Copyright (C) 2010 Stefan Kost <stefan.kost@nokia.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++#ifndef __GST_JFIF_MUX_H__
++#define __GST_JFIF_MUX_H__
++
++#include <gst/gst.h>
++
++#include "gstjpegformat.h"
++
++G_BEGIN_DECLS
++
++#define GST_TYPE_JIF_MUX \
++  (gst_jif_mux_get_type())
++#define GST_JIF_MUX(obj) \
++  (G_TYPE_CHECK_INSTANCE_CAST((obj),GST_TYPE_JIF_MUX,GstJifMux))
++#define GST_JIF_MUX_CLASS(klass) \
++  (G_TYPE_CHECK_CLASS_CAST((klass),GST_TYPE_JIF_MUX,GstJifMuxClass))
++#define GST_IS_JIF_MUX(obj) \
++  (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_JIF_MUX))
++#define GST_IS_JIF_MUX_CLASS(klass) \
++  (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_JIF_MUX))
++#define GST_JIF_MUX_CAST(obj) ((GstJifMux *) (obj))
++
++typedef struct _GstJifMux           GstJifMux;
++typedef struct _GstJifMuxClass      GstJifMuxClass;
++
++struct _GstJifMux {
++  GstElement element;
++
++  GstPad *srcpad;
++
++  /* list of GstJifMuxMarker */
++  GList *markers;
++  guint scan_size;
++  const guint8 *scan_data;
++};
++
++struct _GstJifMuxClass {
++  GstElementClass  parent_class;
++};
++
++GType gst_jif_mux_get_type (void);
++
++GST_ELEMENT_REGISTER_DECLARE (jifmux);
++
++G_END_DECLS
++
++#endif /* __GST_JFIF_MUX_H__ */
+diff --git a/gst/jpegformat/gstjpegformat.c b/gst/jpegformat/gstjpegformat.c
+new file mode 100644
+index 0000000..bc37045
+--- /dev/null
++++ b/gst/jpegformat/gstjpegformat.c
+@@ -0,0 +1,45 @@
++/* GStreamer
++ *
++ * jpegformat: a plugin for JPEG Interchange Format
++ *
++ * Copyright (C) <2010> Stefan Kost <ensonic@users.sf.net>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include "gstjpegparse.h"
++#include "gstjifmux.h"
++
++static gboolean
++plugin_init (GstPlugin * plugin)
++{
++  gboolean ret = FALSE;
++
++  ret |= GST_ELEMENT_REGISTER (jpegparse, plugin);
++  ret |= GST_ELEMENT_REGISTER (jifmux, plugin);
++
++  return ret;
++}
++
++GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
++    GST_VERSION_MINOR,
++    jpegformat,
++    "JPEG interchange format plugin",
++    plugin_init, VERSION, "LGPL", GST_PACKAGE_NAME, GST_PACKAGE_ORIGIN)
+diff --git a/gst/jpegformat/gstjpegformat.h b/gst/jpegformat/gstjpegformat.h
+new file mode 100644
+index 0000000..be69268
+--- /dev/null
++++ b/gst/jpegformat/gstjpegformat.h
+@@ -0,0 +1,92 @@
++/* GStreamer
++ *
++ * jpegformat: a plugin for JPEG Interchange Format
++ *
++ * Copyright (C) <2010> Stefan Kost <ensonic@users.sf.net>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++
++#ifndef __GST_JPEG_FORMAT_H__
++#define __GST_JPEG_FORMAT_H__
++
++G_BEGIN_DECLS
++
++/*
++ * JPEG Markers
++ */
++ 
++/* Start Of Frame markers, non-differential, Huffman coding */
++#define SOF0      0xc0  /* Baseline DCT */
++#define SOF1      0xc1  /* Extended sequential DCT */
++#define SOF2      0xc2  /* Progressive DCT */
++#define SOF3      0xc3  /* Lossless */
++
++/* Start Of Frame markers, differential, Huffman coding */
++#define SOF5      0xc5
++#define SOF6      0xc6
++#define SOF7      0xc7
++
++/* Start Of Frame markers, non-differential, arithmetic coding */
++#define JPG       0xc8  /* Reserved */
++#define SOF9      0xc9
++#define SOF10     0xca
++#define SOF11     0xcb
++
++/* Start Of Frame markers, differential, arithmetic coding */
++#define SOF13     0xcd
++#define SOF14     0xce
++#define SOF15     0xcf
++
++/* Restart interval termination */
++#define RST0      0xd0  /* Restart ... */
++#define RST1      0xd1
++#define RST2      0xd2
++#define RST3      0xd3
++#define RST4      0xd4
++#define RST5      0xd5
++#define RST6      0xd6
++#define RST7      0xd7
++
++#define SOI       0xd8  /* Start of image */
++#define EOI       0xd9  /* End Of Image */
++#define SOS       0xda  /* Start Of Scan */
++
++#define DHT       0xc4  /* Huffman Table(s) */
++#define DAC       0xcc  /* Algorithmic Coding Table */
++#define DQT       0xdb  /* Quantisation Table(s) */
++#define DNL       0xdc  /* Number of lines */
++#define DRI       0xdd  /* Restart Interval */
++#define DHP       0xde  /* Hierarchical progression */
++#define EXP       0xdf
++
++#define APP0      0xe0  /* Application marker */
++#define APP1      0xe1
++#define APP2      0xe2
++#define APP13     0xed
++#define APP14     0xee
++#define APP15     0xef
++
++#define JPG0      0xf0  /* Reserved ... */
++#define JPG13     0xfd
++#define COM       0xfe  /* Comment */
++
++#define TEM       0x01
++
++G_END_DECLS
++
++#endif /* __GST_JPEG_FORMAT_H__ */
+diff --git a/gst/jpegformat/gstjpegparse.c b/gst/jpegformat/gstjpegparse.c
+new file mode 100644
+index 0000000..5231879
+--- /dev/null
++++ b/gst/jpegformat/gstjpegparse.c
+@@ -0,0 +1,901 @@
++/* GStreamer
++ *
++ * jpegparse: a parser for JPEG streams
++ *
++ * Copyright (C) <2009> Arnout Vandecappelle (Essensium/Mind) <arnout@mind.be>
++ *                      Víctor Manuel Jáquez Leal <vjaquez@igalia.com>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++/**
++ * SECTION:element-jpegparse
++ * @title: jpegparse
++ * @short_description: JPEG parser
++ *
++ * Parses a JPEG stream into JPEG images.  It looks for EOI boundaries to
++ * split a continuous stream into single-frame buffers. Also reads the
++ * image header searching for image properties such as width and height
++ * among others. Jpegparse can also extract metadata (e.g. xmp).
++ *
++ * ## Example launch line
++ * |[
++ * gst-launch-1.0 -v souphttpsrc location=... ! jpegparse ! matroskamux ! filesink location=...
++ * ]|
++ * The above pipeline fetches a motion JPEG stream from an IP camera over
++ * HTTP and stores it in a matroska file.
++ *
++ */
++/* FIXME: output plain JFIF APP marker only. This provides best code reuse.
++ * JPEG decoders would not need to handle this part anymore. Also when remuxing
++ * (... ! jpegparse ! ... ! jifmux ! ...) metadata consolidation would be
++ * easier.
++ */
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <string.h>
++#include <gst/base/gstbytereader.h>
++#include <gst/tag/tag.h>
++
++#include "gstjpegparse.h"
++
++static GstStaticPadTemplate gst_jpeg_parse_src_pad_template =
++GST_STATIC_PAD_TEMPLATE ("src",
++    GST_PAD_SRC,
++    GST_PAD_ALWAYS,
++    GST_STATIC_CAPS ("image/jpeg, "
++        "format = (string) { I420, Y41B, UYVY, YV12 }, "
++        "width = (int) [ 0, MAX ],"
++        "height = (int) [ 0, MAX ], "
++        "framerate = (fraction) [ 0/1, MAX ], " "parsed = (boolean) true")
++    );
++
++static GstStaticPadTemplate gst_jpeg_parse_sink_pad_template =
++GST_STATIC_PAD_TEMPLATE ("sink",
++    GST_PAD_SINK,
++    GST_PAD_ALWAYS,
++    GST_STATIC_CAPS ("image/jpeg")
++    );
++
++GST_DEBUG_CATEGORY_STATIC (jpeg_parse_debug);
++#define GST_CAT_DEFAULT jpeg_parse_debug
++
++static GstFlowReturn
++gst_jpeg_parse_handle_frame (GstBaseParse * bparse, GstBaseParseFrame * frame,
++    gint * skipsize);
++static gboolean gst_jpeg_parse_set_sink_caps (GstBaseParse * parse,
++    GstCaps * caps);
++static gboolean gst_jpeg_parse_sink_event (GstBaseParse * parse,
++    GstEvent * event);
++static gboolean gst_jpeg_parse_start (GstBaseParse * parse);
++static gboolean gst_jpeg_parse_stop (GstBaseParse * parse);
++static GstFlowReturn gst_jpeg_parse_pre_push_frame (GstBaseParse * bparse,
++    GstBaseParseFrame * frame);
++
++#define gst_jpeg_parse_parent_class parent_class
++G_DEFINE_TYPE (GstJpegParse, gst_jpeg_parse, GST_TYPE_BASE_PARSE);
++GST_ELEMENT_REGISTER_DEFINE (jpegparse, "jpegparse", GST_RANK_NONE,
++    GST_TYPE_JPEG_PARSE);
++
++static void
++gst_jpeg_parse_class_init (GstJpegParseClass * klass)
++{
++  GstBaseParseClass *gstbaseparse_class;
++  GstElementClass *gstelement_class;
++
++  gstbaseparse_class = (GstBaseParseClass *) klass;
++  gstelement_class = (GstElementClass *) klass;
++
++  gstbaseparse_class->start = gst_jpeg_parse_start;
++  gstbaseparse_class->stop = gst_jpeg_parse_stop;
++  gstbaseparse_class->set_sink_caps = gst_jpeg_parse_set_sink_caps;
++  gstbaseparse_class->sink_event = gst_jpeg_parse_sink_event;
++  gstbaseparse_class->handle_frame = gst_jpeg_parse_handle_frame;
++  gstbaseparse_class->pre_push_frame = gst_jpeg_parse_pre_push_frame;
++
++  gst_element_class_add_static_pad_template (gstelement_class,
++      &gst_jpeg_parse_src_pad_template);
++  gst_element_class_add_static_pad_template (gstelement_class,
++      &gst_jpeg_parse_sink_pad_template);
++
++  gst_element_class_set_static_metadata (gstelement_class,
++      "JPEG stream parser",
++      "Video/Parser",
++      "Parse JPEG images into single-frame buffers",
++      "Arnout Vandecappelle (Essensium/Mind) <arnout@mind.be>");
++
++  GST_DEBUG_CATEGORY_INIT (jpeg_parse_debug, "jpegparse", 0, "JPEG parser");
++}
++
++static void
++gst_jpeg_parse_init (GstJpegParse * parse)
++{
++  parse->next_ts = GST_CLOCK_TIME_NONE;
++}
++
++static gboolean
++gst_jpeg_parse_set_sink_caps (GstBaseParse * bparse, GstCaps * caps)
++{
++  GstJpegParse *parse = GST_JPEG_PARSE_CAST (bparse);
++  GstStructure *s = gst_caps_get_structure (caps, 0);
++  const GValue *framerate;
++
++  if ((framerate = gst_structure_get_value (s, "framerate")) != NULL) {
++    if (GST_VALUE_HOLDS_FRACTION (framerate)) {
++      parse->framerate_numerator = gst_value_get_fraction_numerator (framerate);
++      parse->framerate_denominator =
++          gst_value_get_fraction_denominator (framerate);
++      parse->has_fps = TRUE;
++      GST_DEBUG_OBJECT (parse, "got framerate of %d/%d",
++          parse->framerate_numerator, parse->framerate_denominator);
++    }
++  }
++
++  return TRUE;
++}
++
++
++/*
++ * gst_jpeg_parse_skip_to_jpeg_header:
++ * @parse: the parser
++ *
++ * Flush everything until the next JPEG header.  The header is considered
++ * to be the a start marker SOI (0xff 0xd8) followed by any other marker
++ * (0xff ...).
++ *
++ * Returns: TRUE if the header was found, FALSE if more data is needed.
++ */
++static gboolean
++gst_jpeg_parse_skip_to_jpeg_header (GstJpegParse * parse, GstMapInfo * mapinfo,
++    gint * skipsize)
++{
++  gboolean ret = TRUE;
++  GstByteReader reader;
++
++  if (mapinfo->size < 4)
++    return FALSE;
++
++  gst_byte_reader_init (&reader, mapinfo->data, mapinfo->size);
++
++  *skipsize = gst_byte_reader_masked_scan_uint32 (&reader, 0xffffff00,
++      0xffd8ff00, 0, mapinfo->size);
++  if (*skipsize == -1) {
++    *skipsize = mapinfo->size - 3;      /* Last 3 bytes + 1 more may match header. */
++    ret = FALSE;
++  }
++  return ret;
++}
++
++static inline gboolean
++gst_jpeg_parse_parse_tag_has_entropy_segment (guint8 tag)
++{
++  if (tag == SOS || (tag >= RST0 && tag <= RST7))
++    return TRUE;
++  return FALSE;
++}
++
++/* returns image length in bytes if parsed successfully,
++ * otherwise 0 if more data needed,
++ * if < 0 the absolute value needs to be flushed */
++static gint
++gst_jpeg_parse_get_image_length (GstJpegParse * parse, GstMapInfo * mapinfo)
++{
++  guint size;
++  gboolean resync;
++  gint offset, noffset;
++  GstByteReader reader;
++
++  size = mapinfo->size;
++  gst_byte_reader_init (&reader, mapinfo->data, mapinfo->size);
++
++  /* TODO could be removed as previous functions already guarantee this to be
++   * true */
++  /* we expect at least 4 bytes, first of which start marker */
++  if (gst_byte_reader_masked_scan_uint32 (&reader, 0xffff0000, 0xffd80000, 0,
++          4))
++    return 0;
++
++  GST_DEBUG ("Parsing jpeg image data (%u bytes)", size);
++
++  GST_DEBUG ("Parse state: offset=%d, resync=%d, entropy len=%d",
++      parse->last_offset, parse->last_resync, parse->last_entropy_len);
++
++  /* offset is 2 less than actual offset;
++   * - adapter needs at least 4 bytes for scanning,
++   * - start and end marker ensure at least that much
++   */
++  /* resume from state offset */
++  offset = parse->last_offset;
++
++  while (1) {
++    guint frame_len;
++    guint32 value;
++
++    noffset =
++        gst_byte_reader_masked_scan_uint32_peek (&reader, 0x0000ff00,
++        0x0000ff00, offset, size - offset, &value);
++    /* lost sync if 0xff marker not where expected */
++    if ((resync = (noffset != offset))) {
++      GST_DEBUG ("Lost sync at 0x%08x, resyncing", offset + 2);
++    }
++    /* may have marker, but could have been resyncng */
++    resync = resync || parse->last_resync;
++    /* Skip over extra 0xff */
++    while ((noffset >= 0) && ((value & 0xff) == 0xff)) {
++      noffset++;
++      noffset =
++          gst_byte_reader_masked_scan_uint32_peek (&reader, 0x0000ff00,
++          0x0000ff00, noffset, size - noffset, &value);
++    }
++    /* enough bytes left for marker? (we need 0xNN after the 0xff) */
++    if (noffset < 0) {
++      GST_DEBUG ("at end of input and no EOI marker found, need more data");
++      goto need_more_data;
++    }
++
++    /* now lock on the marker we found */
++    offset = noffset;
++    value = value & 0xff;
++    if (value == 0xd9) {
++      GST_DEBUG ("0x%08x: EOI marker", offset + 2);
++      /* clear parse state */
++      parse->last_resync = FALSE;
++      parse->last_offset = 0;
++      return (offset + 4);
++    } else if (value == 0xd8) {
++      /* Skip this frame if we found another SOI marker */
++      GST_DEBUG ("0x%08x: SOI marker before EOI, skipping", offset + 2);
++      /* clear parse state */
++      parse->last_resync = FALSE;
++      parse->last_offset = 0;
++      return -(offset + 2);
++    }
++
++    if (value >= 0xd0 && value <= 0xd7)
++      frame_len = 0;
++    else {
++      /* peek tag and subsequent length */
++      if (offset + 2 + 4 > size)
++        goto need_more_data;
++      else
++        gst_byte_reader_masked_scan_uint32_peek (&reader, 0x0, 0x0, offset + 2,
++            4, &frame_len);
++      frame_len = frame_len & 0xffff;
++    }
++    GST_DEBUG ("0x%08x: tag %02x, frame_len=%u", offset + 2, value, frame_len);
++    /* the frame length includes the 2 bytes for the length; here we want at
++     * least 2 more bytes at the end for an end marker */
++    if (offset + 2 + 2 + frame_len + 2 > size) {
++      goto need_more_data;
++    }
++
++    if (gst_jpeg_parse_parse_tag_has_entropy_segment (value)) {
++      guint eseglen = parse->last_entropy_len;
++
++      GST_DEBUG ("0x%08x: finding entropy segment length", offset + 2);
++      noffset = offset + 2 + frame_len + eseglen;
++      while (1) {
++        noffset = gst_byte_reader_masked_scan_uint32_peek (&reader, 0x0000ff00,
++            0x0000ff00, noffset, size - noffset, &value);
++        if (noffset < 0) {
++          /* need more data */
++          parse->last_entropy_len = size - offset - 4 - frame_len - 2;
++          goto need_more_data;
++        }
++        if ((value & 0xff) != 0x00) {
++          eseglen = noffset - offset - frame_len - 2;
++          break;
++        }
++        noffset++;
++      }
++      parse->last_entropy_len = 0;
++      frame_len += eseglen;
++      GST_DEBUG ("entropy segment length=%u => frame_len=%u", eseglen,
++          frame_len);
++    }
++    if (resync) {
++      /* check if we will still be in sync if we interpret
++       * this as a sync point and skip this frame */
++      noffset = offset + frame_len + 2;
++      noffset =
++          gst_byte_reader_masked_scan_uint32 (&reader, 0x0000ff00, 0x0000ff00,
++          noffset, 4);
++      if (noffset < 0) {
++        /* ignore and continue resyncing until we hit the end
++         * of our data or find a sync point that looks okay */
++        offset++;
++        continue;
++      }
++      GST_DEBUG ("found sync at 0x%x", offset + 2);
++    }
++
++    offset += frame_len + 2;
++  }
++
++  /* EXITS */
++need_more_data:
++  {
++    parse->last_offset = offset;
++    parse->last_resync = resync;
++    return 0;
++  }
++}
++
++static inline gboolean
++gst_jpeg_parse_sof (GstJpegParse * parse, GstByteReader * reader)
++{
++  guint8 numcomps = 0;          /* Number of components in image
++                                   (1 for gray, 3 for YUV, etc.) */
++  guint8 precision;             /* precision (in bits) for the samples */
++  guint8 compId[3] G_GNUC_UNUSED;       /* unique value identifying each component */
++  guint8 qtId[3] G_GNUC_UNUSED; /* quantization table ID to use for this comp */
++  guint8 blockWidth[3];         /* Array[numComponents] giving the number of
++                                   blocks (horiz) in this component */
++  guint8 blockHeight[3];        /* Same for the vertical part of this component */
++  guint8 i, value = 0;
++  gint temp;
++
++  /* flush length field */
++  if (!gst_byte_reader_skip (reader, 2))
++    return FALSE;
++
++  /* Get sample precision */
++  if (!gst_byte_reader_get_uint8 (reader, &precision))
++    return FALSE;
++
++  /* Get w and h */
++  if (!gst_byte_reader_get_uint16_be (reader, &parse->height))
++    return FALSE;
++  if (!gst_byte_reader_get_uint16_be (reader, &parse->width))
++    return FALSE;
++
++  /* Get number of components */
++  if (!gst_byte_reader_get_uint8 (reader, &numcomps))
++    return FALSE;
++
++  if (numcomps > 3)             /* FIXME */
++    return FALSE;
++
++  /* Get decimation and quantization table id for each component */
++  for (i = 0; i < numcomps; i++) {
++    /* Get component ID number */
++    if (!gst_byte_reader_get_uint8 (reader, &value))
++      return FALSE;
++    compId[i] = value;
++
++    /* Get decimation */
++    if (!gst_byte_reader_get_uint8 (reader, &value))
++      return FALSE;
++    blockWidth[i] = (value & 0xf0) >> 4;
++    blockHeight[i] = (value & 0x0f);
++
++    /* Get quantization table id */
++    if (!gst_byte_reader_get_uint8 (reader, &value))
++      return FALSE;
++    qtId[i] = value;
++  }
++
++  if (numcomps == 1) {
++    /* gray image - no format */
++    parse->format = "";
++  } else if (numcomps == 3) {
++    temp = (blockWidth[0] * blockHeight[0]) / (blockWidth[1] * blockHeight[1]);
++
++    if (temp == 4 && blockHeight[0] == 2)
++      parse->format = "I420";
++    else if (temp == 4 && blockHeight[0] == 4)
++      parse->format = "Y41B";
++    else if (temp == 2)
++      parse->format = "UYVY";
++    else if (temp == 1)
++      parse->format = "YV12";
++    else
++      parse->format = "";
++  } else {
++    return FALSE;
++  }
++
++  GST_DEBUG_OBJECT (parse, "Header parsed");
++
++  return TRUE;
++}
++
++static inline gboolean
++gst_jpeg_parse_skip_marker (GstJpegParse * parse,
++    GstByteReader * reader, guint8 marker)
++{
++  guint16 size = 0;
++
++  if (!gst_byte_reader_get_uint16_be (reader, &size))
++    return FALSE;
++
++#ifndef GST_DISABLE_GST_DEBUG
++  /* We'd pry the id of the skipped application segment */
++  if (marker >= APP0 && marker <= APP15) {
++    const gchar *id_str = NULL;
++
++    if (gst_byte_reader_peek_string_utf8 (reader, &id_str)) {
++      GST_DEBUG_OBJECT (parse, "unhandled marker %x: '%s' skipping %u bytes",
++          marker, id_str ? id_str : "(NULL)", size);
++    } else {
++      GST_DEBUG_OBJECT (parse, "unhandled marker %x skipping %u bytes", marker,
++          size);
++    }
++  }
++#else
++  GST_DEBUG_OBJECT (parse, "unhandled marker %x skipping %u bytes", marker,
++      size);
++#endif // GST_DISABLE_GST_DEBUG
++
++  if (!gst_byte_reader_skip (reader, size - 2))
++    return FALSE;
++
++  return TRUE;
++}
++
++static inline GstTagList *
++get_tag_list (GstJpegParse * parse)
++{
++  if (!parse->tags)
++    parse->tags = gst_tag_list_new_empty ();
++  return parse->tags;
++}
++
++static inline void
++extract_and_queue_tags (GstJpegParse * parse, guint size, guint8 * data,
++    GstTagList * (*tag_func) (GstBuffer * buff))
++{
++  GstTagList *tags;
++  GstBuffer *buf;
++
++  buf = gst_buffer_new_wrapped_full (GST_MEMORY_FLAG_READONLY, data, size, 0,
++      size, NULL, NULL);
++
++  tags = tag_func (buf);
++  gst_buffer_unref (buf);
++
++  if (tags) {
++    GstTagList *taglist = parse->tags;
++    if (taglist) {
++      gst_tag_list_insert (taglist, tags, GST_TAG_MERGE_REPLACE);
++      gst_tag_list_unref (tags);
++    } else {
++      parse->tags = tags;
++    }
++    GST_DEBUG_OBJECT (parse, "collected tags: %" GST_PTR_FORMAT, parse->tags);
++  }
++}
++
++static inline gboolean
++gst_jpeg_parse_app1 (GstJpegParse * parse, GstByteReader * reader)
++{
++  guint16 size = 0;
++  const gchar *id_str;
++  const guint8 *data = NULL;
++
++  if (!gst_byte_reader_get_uint16_be (reader, &size))
++    return FALSE;
++
++  size -= 2;                    /* 2 bytes for the mark */
++  if (!gst_byte_reader_peek_string_utf8 (reader, &id_str))
++    return FALSE;
++
++  if (!strncmp (id_str, "Exif", 4)) {
++
++    /* skip id + NUL + padding */
++    if (!gst_byte_reader_skip (reader, 6))
++      return FALSE;
++    size -= 6;
++
++    /* handle exif metadata */
++    if (!gst_byte_reader_get_data (reader, size, &data))
++      return FALSE;
++
++    extract_and_queue_tags (parse, size, (guint8 *) data,
++        gst_tag_list_from_exif_buffer_with_tiff_header);
++
++    GST_LOG_OBJECT (parse, "parsed marker %x: '%s' %u bytes",
++        APP1, id_str, size);
++
++  } else if (!strncmp (id_str, "http://ns.adobe.com/xap/1.0/", 28)) {
++
++    /* skip the id + NUL */
++    if (!gst_byte_reader_skip (reader, 29))
++      return FALSE;
++    size -= 29;
++
++    /* handle xmp metadata */
++    if (!gst_byte_reader_get_data (reader, size, &data))
++      return FALSE;
++
++    extract_and_queue_tags (parse, size, (guint8 *) data,
++        gst_tag_list_from_xmp_buffer);
++
++    GST_LOG_OBJECT (parse, "parsed marker %x: '%s' %u bytes",
++        APP1, id_str, size);
++
++  } else {
++    /* restore the byte position and size */
++    reader->size += 2;
++    reader->byte -= 2;
++    if (!gst_jpeg_parse_skip_marker (parse, reader, APP1))
++      return FALSE;
++  }
++
++  return TRUE;
++}
++
++static inline gchar *
++get_utf8_from_data (const guint8 * data, guint16 size)
++{
++  const gchar *env_vars[] = { "GST_JPEG_TAG_ENCODING",
++    "GST_TAG_ENCODING", NULL
++  };
++  const char *str = (gchar *) data;
++
++  return gst_tag_freeform_string_to_utf8 (str, size, env_vars);
++}
++
++/* read comment and post as tag */
++static inline gboolean
++gst_jpeg_parse_com (GstJpegParse * parse, GstByteReader * reader)
++{
++  const guint8 *data = NULL;
++  guint16 size = 0;
++  gchar *comment;
++
++  if (!gst_byte_reader_get_uint16_be (reader, &size))
++    return FALSE;
++
++  size -= 2;
++  if (!gst_byte_reader_get_data (reader, size, &data))
++    return FALSE;
++
++  comment = get_utf8_from_data (data, size);
++
++  if (comment) {
++    GstTagList *taglist = get_tag_list (parse);
++    gst_tag_list_add (taglist, GST_TAG_MERGE_REPLACE,
++        GST_TAG_COMMENT, comment, NULL);
++    GST_DEBUG_OBJECT (parse, "collected tags: %" GST_PTR_FORMAT, taglist);
++    g_free (comment);
++  }
++
++  return TRUE;
++}
++
++static gboolean
++gst_jpeg_parse_read_header (GstJpegParse * parse, GstMapInfo * map, gint len)
++{
++  GstByteReader reader;
++  guint8 marker = 0;
++  gboolean foundSOF = FALSE;
++
++  gst_byte_reader_init (&reader, map->data, len);
++
++  if (!gst_byte_reader_peek_uint8 (&reader, &marker))
++    goto error;
++
++  while (marker == 0xff) {
++    if (!gst_byte_reader_skip (&reader, 1))
++      goto error;
++
++    if (!gst_byte_reader_get_uint8 (&reader, &marker))
++      goto error;
++
++    GST_DEBUG_OBJECT (parse, "marker = %x", marker);
++
++    switch (marker) {
++      case SOS:                /* start of scan (begins compressed data) */
++        goto done;
++
++      case SOI:
++        break;
++
++      case DRI:
++        if (!gst_byte_reader_skip (&reader, 4)) /* fixed size */
++          goto error;
++        break;
++
++      case COM:
++        if (!gst_jpeg_parse_com (parse, &reader))
++          goto error;
++        break;
++
++      case APP1:
++        if (!gst_jpeg_parse_app1 (parse, &reader))
++          goto error;
++        break;
++
++      case DHT:
++      case DQT:
++        /* Ignore these codes */
++        if (!gst_jpeg_parse_skip_marker (parse, &reader, marker))
++          goto error;
++        break;
++
++      case SOF0:
++        /* parse Start Of Frame */
++        if (!gst_jpeg_parse_sof (parse, &reader))
++          goto error;
++
++        foundSOF = TRUE;
++        goto done;
++
++      default:
++        if (marker == JPG || (marker >= JPG0 && marker <= JPG13) ||
++            (marker >= APP0 && marker <= APP15)) {
++          if (!gst_jpeg_parse_skip_marker (parse, &reader, marker))
++            goto error;
++        } else
++          goto unhandled;
++    }
++
++    if (!gst_byte_reader_peek_uint8 (&reader, &marker))
++      goto error;
++  }
++done:
++
++  return foundSOF;
++
++  /* ERRORS */
++error:
++  {
++    GST_WARNING_OBJECT (parse,
++        "Error parsing image header (need more than %u bytes available)",
++        gst_byte_reader_get_remaining (&reader));
++    return FALSE;
++  }
++unhandled:
++  {
++    GST_WARNING_OBJECT (parse, "unhandled marker %x, leaving", marker);
++    /* Not SOF or SOI.  Must not be a JPEG file (or file pointer
++     * is placed wrong).  In either case, it's an error. */
++    return FALSE;
++  }
++}
++
++static gboolean
++gst_jpeg_parse_set_new_caps (GstJpegParse * parse, gboolean header_ok)
++{
++  GstCaps *caps;
++  gboolean res;
++
++  GST_DEBUG_OBJECT (parse, "setting caps on srcpad (hdr_ok=%d, have_fps=%d)",
++      header_ok, parse->has_fps);
++
++  caps = gst_caps_new_simple ("image/jpeg",
++      "parsed", G_TYPE_BOOLEAN, TRUE, NULL);
++
++  if (header_ok == TRUE) {
++    gst_caps_set_simple (caps,
++        "format", G_TYPE_STRING, parse->format,
++        "width", G_TYPE_INT, parse->width,
++        "height", G_TYPE_INT, parse->height, NULL);
++  }
++
++  if (parse->has_fps == TRUE) {
++    /* we have a framerate */
++    gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION,
++        parse->framerate_numerator, parse->framerate_denominator, NULL);
++
++    if (!GST_CLOCK_TIME_IS_VALID (parse->duration)
++        && parse->framerate_numerator != 0) {
++      parse->duration = gst_util_uint64_scale_int (GST_SECOND,
++          parse->framerate_denominator, parse->framerate_numerator);
++    }
++  } else {
++    /* unknown duration */
++    parse->duration = GST_CLOCK_TIME_NONE;
++    gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, 1, 1, NULL);
++  }
++
++  GST_DEBUG_OBJECT (parse,
++      "setting downstream caps on %s:%s to %" GST_PTR_FORMAT,
++      GST_DEBUG_PAD_NAME (GST_BASE_PARSE_SRC_PAD (parse)), caps);
++  res = gst_pad_set_caps (GST_BASE_PARSE_SRC_PAD (parse), caps);
++  gst_caps_unref (caps);
++
++  return res;
++
++}
++
++static GstFlowReturn
++gst_jpeg_parse_pre_push_frame (GstBaseParse * bparse, GstBaseParseFrame * frame)
++{
++  GstJpegParse *parse = GST_JPEG_PARSE_CAST (bparse);
++  GstBuffer *outbuf = frame->buffer;
++
++  if (parse->has_fps && parse->framerate_numerator != 0
++      && !GST_CLOCK_TIME_IS_VALID (parse->next_ts))
++    parse->next_ts = bparse->segment.start;
++
++  GST_BUFFER_TIMESTAMP (outbuf) = parse->next_ts;
++
++  if (parse->has_fps && GST_CLOCK_TIME_IS_VALID (parse->next_ts)
++      && GST_CLOCK_TIME_IS_VALID (parse->duration)) {
++    parse->next_ts += parse->duration;
++  } else {
++    parse->duration = GST_CLOCK_TIME_NONE;
++    parse->next_ts = GST_CLOCK_TIME_NONE;
++  }
++
++  GST_BUFFER_DURATION (outbuf) = parse->duration;
++
++  return GST_FLOW_OK;
++}
++
++static GstFlowReturn
++gst_jpeg_parse_handle_frame (GstBaseParse * bparse, GstBaseParseFrame * frame,
++    gint * skipsize)
++{
++  GstJpegParse *parse = GST_JPEG_PARSE_CAST (bparse);
++  gint len;
++  GstClockTime timestamp, duration;
++  GstMapInfo mapinfo;
++  gboolean header_ok;
++
++  timestamp = GST_BUFFER_PTS (frame->buffer);
++  duration = GST_BUFFER_DURATION (frame->buffer);
++
++  if (!gst_buffer_map (frame->buffer, &mapinfo, GST_MAP_READ)) {
++    return GST_FLOW_ERROR;
++  }
++
++  if (!gst_jpeg_parse_skip_to_jpeg_header (parse, &mapinfo, skipsize)) {
++    gst_buffer_unmap (frame->buffer, &mapinfo);
++    return GST_FLOW_OK;
++  }
++
++  if (G_UNLIKELY (!GST_CLOCK_TIME_IS_VALID (parse->next_ts)))
++    parse->next_ts = timestamp;
++
++  if (G_LIKELY (GST_CLOCK_TIME_IS_VALID (duration)))
++    parse->duration = duration;
++
++  len = gst_jpeg_parse_get_image_length (parse, &mapinfo);
++  if (len == 0) {
++    gst_buffer_unmap (frame->buffer, &mapinfo);
++    return GST_FLOW_OK;
++  } else if (len < 0) {
++    *skipsize = -len;
++    gst_buffer_unmap (frame->buffer, &mapinfo);
++    return GST_FLOW_OK;
++  }
++
++  /* check if we already have a EOI */
++  GST_LOG_OBJECT (parse, "parsed image of size %d", len);
++
++  /* reset the offset (only when we flushed) */
++  parse->last_offset = 0;
++  parse->last_entropy_len = 0;
++
++  header_ok = gst_jpeg_parse_read_header (parse, &mapinfo, len);
++
++  gst_buffer_unmap (frame->buffer, &mapinfo);
++
++  if (parse->width != parse->caps_width
++      || parse->height != parse->caps_height
++      || parse->framerate_numerator !=
++      parse->caps_framerate_numerator
++      || parse->framerate_denominator != parse->caps_framerate_denominator) {
++    if (!gst_jpeg_parse_set_new_caps (parse, header_ok)) {
++      GST_ELEMENT_ERROR (parse, CORE, NEGOTIATION,
++          ("Can't set caps to the src pad"), ("Can't set caps to the src pad"));
++      return GST_FLOW_ERROR;
++    }
++
++    if (parse->tags) {
++      GST_DEBUG_OBJECT (parse, "Pushing tags: %" GST_PTR_FORMAT, parse->tags);
++      gst_pad_push_event (GST_BASE_PARSE_SRC_PAD (parse),
++          gst_event_new_tag (parse->tags));
++      parse->tags = NULL;
++    }
++
++    parse->caps_width = parse->width;
++    parse->caps_height = parse->height;
++    parse->caps_framerate_numerator = parse->framerate_numerator;
++    parse->caps_framerate_denominator = parse->framerate_denominator;
++  }
++
++
++  return gst_base_parse_finish_frame (bparse, frame, len);
++}
++
++static gboolean
++gst_jpeg_parse_sink_event (GstBaseParse * bparse, GstEvent * event)
++{
++  GstJpegParse *parse = GST_JPEG_PARSE_CAST (bparse);
++  gboolean res = TRUE;
++
++  GST_DEBUG_OBJECT (parse, "event : %s", GST_EVENT_TYPE_NAME (event));
++
++  switch (GST_EVENT_TYPE (event)) {
++    case GST_EVENT_FLUSH_STOP:
++      parse->next_ts = GST_CLOCK_TIME_NONE;
++      parse->duration = GST_CLOCK_TIME_NONE;
++      parse->last_offset = 0;
++      parse->last_entropy_len = 0;
++      parse->last_resync = FALSE;
++      res = GST_BASE_PARSE_CLASS (parent_class)->sink_event (bparse, event);
++      break;
++    case GST_EVENT_TAG:{
++      if (gst_pad_has_current_caps (GST_BASE_PARSE_SRC_PAD (parse)))
++        res = GST_BASE_PARSE_CLASS (parent_class)->sink_event (bparse, event);
++      else {
++        GstTagList *taglist = NULL;
++
++        gst_event_parse_tag (event, &taglist);
++        /* Hold on to the tags till the srcpad caps are definitely set */
++        gst_tag_list_insert (get_tag_list (parse), taglist,
++            GST_TAG_MERGE_REPLACE);
++        GST_DEBUG ("collected tags: %" GST_PTR_FORMAT, parse->tags);
++        gst_event_unref (event);
++      }
++      break;
++    }
++    default:
++      res = GST_BASE_PARSE_CLASS (parent_class)->sink_event (bparse, event);
++      break;
++  }
++
++  return res;
++}
++
++static gboolean
++gst_jpeg_parse_start (GstBaseParse * bparse)
++{
++  GstJpegParse *parse;
++
++  parse = GST_JPEG_PARSE_CAST (bparse);
++
++  parse->has_fps = FALSE;
++
++  parse->width = parse->height = 0;
++  parse->framerate_numerator = 0;
++  parse->framerate_denominator = 1;
++
++  parse->caps_framerate_numerator = parse->caps_framerate_denominator = 0;
++  parse->caps_width = parse->caps_height = -1;
++
++  parse->next_ts = GST_CLOCK_TIME_NONE;
++  parse->duration = GST_CLOCK_TIME_NONE;
++
++  parse->last_offset = 0;
++  parse->last_entropy_len = 0;
++  parse->last_resync = FALSE;
++
++  parse->tags = NULL;
++
++  return TRUE;
++}
++
++static gboolean
++gst_jpeg_parse_stop (GstBaseParse * bparse)
++{
++  GstJpegParse *parse;
++
++  parse = GST_JPEG_PARSE_CAST (bparse);
++
++  if (parse->tags) {
++    gst_tag_list_unref (parse->tags);
++    parse->tags = NULL;
++  }
++
++  return TRUE;
++}
+diff --git a/gst/jpegformat/gstjpegparse.h b/gst/jpegformat/gstjpegparse.h
+new file mode 100644
+index 0000000..e777421
+--- /dev/null
++++ b/gst/jpegformat/gstjpegparse.h
+@@ -0,0 +1,94 @@
++/* GStreamer
++ *
++ * jpegparse: a parser for JPEG streams
++ *
++ * Copyright (C) <2009> Arnout Vandecappelle (Essensium/Mind) <arnout@mind.be>
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++#ifndef __GST_JPEG_PARSE_H__
++#define __GST_JPEG_PARSE_H__
++
++#include <gst/gst.h>
++#include <gst/base/gstadapter.h>
++#include <gst/base/gstbaseparse.h>
++
++#include "gstjpegformat.h"
++
++G_BEGIN_DECLS
++
++#define GST_TYPE_JPEG_PARSE \
++  (gst_jpeg_parse_get_type())
++#define GST_JPEG_PARSE(obj) \
++  (G_TYPE_CHECK_INSTANCE_CAST((obj),GST_TYPE_JPEG_PARSE,GstJpegParse))
++#define GST_JPEG_PARSE_CLASS(klass) \
++  (G_TYPE_CHECK_CLASS_CAST((klass),GST_TYPE_JPEG_PARSE,GstJpegParseClass))
++#define GST_IS_JPEG_PARSE(obj) \
++  (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_JPEG_PARSE))
++#define GST_IS_JPEG_PARSE_CLASS(klass) \
++  (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_JPEG_PARSE))
++#define GST_JPEG_PARSE_CAST(obj) ((GstJpegParse *)obj)
++
++typedef struct _GstJpegParse           GstJpegParse;
++typedef struct _GstJpegParseClass      GstJpegParseClass;
++
++struct _GstJpegParse {
++  GstBaseParse parse;
++
++  guint last_offset;
++  guint last_entropy_len;
++  gboolean last_resync;
++
++  /* negotiated state */
++  gint caps_width, caps_height;
++  gint caps_framerate_numerator;
++  gint caps_framerate_denominator;
++
++  /* the parsed frame size */
++  guint16 width, height;
++
++  /* format color space */
++  const gchar *format;
++
++  /* TRUE if the src caps sets a specific framerate */
++  gboolean has_fps;
++
++  /* the (expected) timestamp of the next frame */
++  guint64 next_ts;
++
++  /* duration of the current frame */
++  guint64 duration;
++
++  /* video state */
++  gint framerate_numerator;
++  gint framerate_denominator;
++
++  /* tags */
++  GstTagList *tags;
++};
++
++struct _GstJpegParseClass {
++  GstBaseParseClass  parent_class;
++};
++
++GType gst_jpeg_parse_get_type (void);
++
++GST_ELEMENT_REGISTER_DECLARE (jpegparse);
++
++G_END_DECLS
++
++#endif /* __GST_JPEG_PARSE_H__ */
+diff --git a/gst/jpegformat/meson.build b/gst/jpegformat/meson.build
+new file mode 100644
+index 0000000..4fd78c0
+--- /dev/null
++++ b/gst/jpegformat/meson.build
+@@ -0,0 +1,16 @@
++jpegf_sources = [
++  'gstjpegformat.c',
++  'gstjpegparse.c',
++  'gstjifmux.c',
++]
++
++gstjpegformat = library('gstjpegformat',
++  jpegf_sources,
++  c_args : gst_plugins_bad_args,
++  include_directories : [configinc],
++  dependencies : [gstbase_dep, gsttag_dep],
++  install : true,
++  install_dir : plugins_install_dir,
++)
++pkgconfig.generate(gstjpegformat, install_dir : plugins_pkgconfig_install_dir)
++plugins += [gstjpegformat]
+diff --git a/gst/meson.build b/gst/meson.build
+index 05b0b06..271e303 100644
+--- a/gst/meson.build
++++ b/gst/meson.build
+@@ -2,7 +2,7 @@ foreach plugin : ['alpha', 'apetag', 'audiofx', 'audioparsers', 'auparse',
+                   'autodetect', 'avi', 'camerabin2', 'cutter', 'debugutils', 'deinterlace',
+                   'dtmf', 'effectv', 'equalizer', 'flv', 'flx', 'goom',
+                   'goom2k1', 'icydemux', 'id3demux', 'imagefreeze',
+-                  'interleave', 'isomp4', 'law', 'level', 'matroska',
++                  'interleave', 'isomp4', 'jpegformat', 'law', 'level', 'matroska',
+                   'monoscope', 'multifile', 'multipart', 'replaygain', 'rtp',
+                   'rtpmanager', 'rtsp', 'shapewipe', 'smpte', 'spectrum',
+                   'udp', 'videobox', 'videocrop', 'videofilter', 'videomixer',
+diff --git a/meson_options.txt b/meson_options.txt
+index ab3e04b..f871e13 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -22,6 +22,7 @@ option('id3demux', type : 'feature', value : 'auto')
+ option('imagefreeze', type : 'feature', value : 'auto')
+ option('interleave', type : 'feature', value : 'auto')
+ option('isomp4', type : 'feature', value : 'auto')
++option('jpegformat', type : 'feature', value : 'auto')
+ option('law', type : 'feature', value : 'auto')
+ option('level', type : 'feature', value : 'auto')
+ option('matroska', type : 'feature', value : 'auto')
+@@ -95,6 +96,7 @@ option('v4l2-gudev', type : 'feature', value : 'auto', description : 'Use libgud
+ # Common feature options
+ option('examples', type : 'feature', value : 'auto', yield : true)
+ option('tests', type : 'feature', value : 'auto', yield : true)
++option('introspection', type : 'feature', value : 'auto', yield : true, description : 'Generate gobject-introspection bindings')
+ option('nls', type : 'feature', value : 'auto', yield: true, description : 'Enable native language support (translations)')
+ option('orc', type : 'feature', value : 'auto', yield : true)
+ option('gobject-cast-checks', type : 'feature', value : 'auto', yield : true,

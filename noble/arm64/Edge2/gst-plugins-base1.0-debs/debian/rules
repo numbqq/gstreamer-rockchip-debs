@@ -1,0 +1,72 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/default.mk
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,-O1 -Wl,-z,defs
+export HOME=$(CURDIR)/fake-home
+
+# debian package version
+version=$(shell dpkg-parsechangelog | grep ^Version: | cut -d ' ' -f 2)
+# upstream version
+gst_version=$(shell echo $(version) | cut -d '-' -f 1)
+
+# Let's decide the package name and url depending on the distribution
+DISTRO = "$(shell dpkg-vendor --query vendor)"
+
+GST_PACKAGE_NAME := "GStreamer Base Plugins (unknown Debian derivative)"
+GST_PACKAGE_ORIGIN="https://tracker.debian.org/pkg/gst-plugins-base1.0"
+
+ifeq ($(DISTRO),"Debian")
+GST_PACKAGE_NAME := "GStreamer Base Plugins (Debian)"
+GST_PACKAGE_ORIGIN="https://tracker.debian.org/pkg/gst-plugins-base1.0"
+endif
+
+ifeq ($(DISTRO),"Ubuntu")
+GST_PACKAGE_NAME := "GStreamer Base Plugins (Ubuntu)"
+GST_PACKAGE_ORIGIN="https://launchpad.net/ubuntu/+source/gst-plugins-base1.0"
+endif
+
+conf_flags = -Dpackage-name=$(GST_PACKAGE_NAME) -Dpackage-origin=$(GST_PACKAGE_ORIGIN)
+conf_flags += -Dinstall_plugins_helper="/usr/bin/gstreamer-codec-install"
+conf_flags += -Dauto_features=enabled -Dexamples=disabled -Dtremor=disabled -Ddoc=disabled
+
+ifeq ($(DEB_HOST_ARCH_OS),hurd)
+conf_flags += -Dcdparanoia=disabled
+endif
+
+ifneq ($(DEB_HOST_ARCH_OS),linux)
+conf_flags += -Dalsa=disabled
+endif
+
+%:
+	dh $@
+
+execute_before_dh_auto_clean:
+	rm -rf $(CURDIR)/fake-home
+
+override_dh_auto_configure:
+	dh_auto_configure -- $(conf_flags)
+
+# Only make the tests fail for key architectures
+override_dh_auto_test:
+ifneq (,$(filter $(DEB_HOST_ARCH), amd64))
+	xvfb-run dh_auto_test
+else
+	xvfb-run dh_auto_test || true
+endif
+
+override_dh_makeshlibs:
+	dh_makeshlibs -plibgstreamer-plugins-base1.0-0 -X "/usr/lib/$(DEB_HOST_MULTIARCH)/gstreamer-1.0" -V 'libgstreamer-plugins-base1.0-0 (>= $(gst_version))' -- -c4
+	dh_makeshlibs -plibgstreamer-gl1.0-0 -X "/usr/lib/$(DEB_HOST_MULTIARCH)/gstreamer-1.0" -V 'libgstreamer-gl1.0-0 (>= $(gst_version))' -- -c4
+
+execute_after_dh_install:
+ifneq ($(DEB_HOST_ARCH_OS),hurd)
+	dh_install -pgstreamer1.0-plugins-base debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/gstreamer-1.0/libgstcdparanoia.so
+endif
+
+	mkdir -p $(CURDIR)/fake-home
+	HOME=$(CURDIR)/fake-home \
+	LD_LIBRARY_PATH=debian/libgstreamer-plugins-base1.0-0/usr/lib/$(DEB_HOST_MULTIARCH):debian/libgstreamer-gl1.0-0/usr/lib/$(DEB_HOST_MULTIARCH):$(LD_LIBRARY_PATH) \
+	    dh_gstscancodecs
+	rm -rf $(CURDIR)/fake-home

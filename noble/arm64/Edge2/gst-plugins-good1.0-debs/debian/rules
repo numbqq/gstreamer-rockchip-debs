@@ -1,0 +1,94 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/default.mk
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,-O1 -Wl,-z,defs
+export HOME=$(CURDIR)/fake-home
+export QT_SELECT=5
+
+# debian package version
+version=$(shell dpkg-parsechangelog | grep ^Version: | cut -d ' ' -f 2)
+# upstream version
+gst_version=$(shell echo $(version) | cut -d '-' -f 1)
+
+built_binaries := $(shell dh_listpackages)
+
+# Let's decide the package name and url depending on the distribution
+DISTRO = "$(shell dpkg-vendor --query vendor)"
+
+GST_PACKAGE_NAME := "GStreamer Good Plugins (unknown Debian derivative)"
+GST_PACKAGE_ORIGIN="https://tracker.debian.org/pkg/gst-plugins-good1.0"
+
+ifeq ($(DISTRO),"Debian")
+GST_PACKAGE_NAME := "GStreamer Good Plugins (Debian)"
+GST_PACKAGE_ORIGIN="https://tracker.debian.org/pkg/gst-plugins-good1.0"
+endif
+
+ifeq ($(DISTRO),"Ubuntu")
+GST_PACKAGE_NAME := "GStreamer Good Plugins (Ubuntu)"
+GST_PACKAGE_ORIGIN="https://launchpad.net/ubuntu/+source/gst-plugins-good1.0"
+endif
+
+conf_flags = -Dpackage-name=$(GST_PACKAGE_NAME) -Dpackage-origin=$(GST_PACKAGE_ORIGIN)
+conf_flags += -Dauto_features=enabled -Ddoc=disabled -Drpicamsrc=disabled
+# opencore-amr is in 'universe' in Ubuntu, so we disable these for now
+conf_flags += -Damrnb=disabled -Damrwbdec=disabled
+
+ifeq ($(DEB_HOST_ARCH_OS),hurd)
+conf_flags += -Doss4=disabled
+endif
+
+ifneq ($(DEB_HOST_ARCH_OS),linux)
+conf_flags += -Ddv1394=disabled -Dv4l2=disabled
+endif
+
+ifeq ($(filter gstreamer1.0-qt5,$(built_binaries)),)
+conf_flags += -Dqt5=disabled
+endif
+ifeq ($(filter gstreamer1.0-qt6,$(built_binaries)),)
+conf_flags += -Dqt6=disabled
+endif
+
+# qtwayland-opensource-src isn't built on hurd-i386 or Ubuntu's i386
+ifneq (,$(filter $(DEB_HOST_ARCH), i386 hurd-i386))
+conf_flags += -Dqt-wayland=disabled
+endif
+
+# qt-egl is not available on non-Linux
+ifneq (,$(filter $(DEB_HOST_ARCH), hurd-i386))
+conf_flags += -Dqt-egl=disabled
+endif
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	dh_auto_configure -- $(conf_flags)
+
+execute_before_dh_auto_clean:
+	rm -rf $(CURDIR)/fake-home
+
+# Only make the tests fail for key architectures
+override_dh_auto_test:
+ifneq (,$(filter $(DEB_HOST_ARCH), amd64 arm64))
+	xvfb-run dh_auto_test
+else
+	xvfb-run dh_auto_test || true
+endif
+
+execute_after_dh_install:
+ifneq ($(DEB_HOST_ARCH_OS),hurd)
+	dh_install -pgstreamer1.0-plugins-good debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/gstreamer-1.0/libgstoss4.so
+endif
+
+ifeq ($(DEB_HOST_ARCH_OS),linux)
+	dh_install -pgstreamer1.0-plugins-good debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/gstreamer-1.0/libgst1394.so
+	dh_install -pgstreamer1.0-plugins-good debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/gstreamer-1.0/libgstvideo4linux2.so
+endif
+
+	mkdir -p $(CURDIR)/fake-home
+	HOME=$(CURDIR)/fake-home \
+	LD_LIBRARY_PATH=debian/libgstreamer-plugins-good1.0-0/usr/lib/$(DEB_HOST_MULTIARCH) \
+	    dh_gstscancodecs
+	rm -rf $(CURDIR)/fake-home

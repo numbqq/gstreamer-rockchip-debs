@@ -1,0 +1,5 @@
+usr/lib/*/gstreamer-1.0/*.so
+usr/lib/*/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner
+usr/lib/*/gstreamer1.0/gstreamer-1.0/gst-ptp-helper
+usr/lib/*/*.so.*
+usr/share/locale

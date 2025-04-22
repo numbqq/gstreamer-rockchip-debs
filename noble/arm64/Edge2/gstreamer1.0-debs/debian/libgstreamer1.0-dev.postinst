@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ] && dpkg --compare-versions "$2" lt-nl "1.18.3-2~"
+then
+	dpkg-divert --package libgstreamer1.0-dev --rename --remove /usr/bin/dh_gstscancodecs
+	dpkg-divert --package libgstreamer1.0-dev --rename --remove /usr/share/man/man1/dh_gstscancodecs.1.gz
+fi
+
+#DEBHELPER#

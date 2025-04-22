@@ -1,0 +1,4 @@
+0001-filesrc-Fix-stopping-race-in-pull-mode.patch
+0002-HACK-gstpad-Add-1-sec-timeout-for-activation.patch
+0003-HACK-caps-Consider-dmabuf-subset-of-system-memory.patch
+0004-gst-launch-Fix-random-hang-when-EOS.patch

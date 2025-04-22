@@ -1,0 +1,15 @@
+CVE-2024-4453.patch
+0001-Revert-decodebin-only-emit-drained-signal-when-top-c.patch
+0002-playbin2-send-one-about-to-finish-per-group.patch
+0003-playbin-do-not-drain-on-first-EOS.patch
+0004-playbin2-Fix-deadlock-when-hooking-about-to-finish-s.patch
+0005-playbin3-Fix-Qt-videoplayer-cannot-change-video-stat.patch
+0006-playbin2-Add-preferred-audio-video-sink.patch
+0007-HACK-xvimagesink-Support-dma-buffer-rendering.patch
+0008-video-converter-Support-rockchip-RGA-2D-accel.patch
+#0009-HACK-gl-egl-allow-direct-dmabuf-import-when-unable-t.patch
+0010-glupload-dmabuf-prefer-DirectDmabufExternal-uploader.patch
+0011-videoconvert-Support-preferred-formats.patch
+0012-glupload-Support-NV12_10LE40-and-NV12-NV12_10LE40-NV.patch
+0013-xvimagesink-Defer-prepare-window-when-getting-zero-w.patch
+0014-riff-Fix-bps-caculation-error-for-ADPCM.patch

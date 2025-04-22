@@ -1,0 +1,113 @@
+Source: gstreamer1.0
+Section: libs
+Priority: optional
+Maintainer: Maintainers of GStreamer packages <gstreamer1.0@packages.debian.org>
+Uploaders: Sebastian Dröge <slomo@debian.org>,
+           Sjoerd Simons <sjoerd@debian.org>,
+           Marc Leeman <marc.leeman@gmail.com>,
+Build-Depends: debhelper-compat (= 13),
+               dh-sequence-gir,
+               meson (>= 0.62),
+               pkgconf,
+               perl-doc,
+               zlib1g-dev,
+               libglib2.0-dev,
+               libgmp-dev <!nocheck> | libgmp3-dev <!nocheck>,
+               libgsl-dev <!nocheck> | libgsl0-dev <!nocheck>,
+               libunwind-dev [i386 amd64 armel armhf arm64 powerpc ppc64 ppc64el mipsel mips64el riscv64],
+               libdw-dev [i386 amd64 armel armhf arm64 powerpc ppc64 ppc64el mipsel mips64el riscv64],
+               bison,
+               flex,
+               rustc,
+               libgirepository1.0-dev,
+               gir1.2-glib-2.0,
+               gir1.2-freedesktop,
+               bash-completion,
+               libcap2-bin [linux-any],
+               libcap-dev [linux-any]
+Rules-Requires-Root: no
+Standards-Version: 4.6.2
+Vcs-Git: https://salsa.debian.org/gstreamer-team/gstreamer1.0.git
+Vcs-Browser: https://salsa.debian.org/gstreamer-team/gstreamer1.0/
+Homepage: https://gstreamer.freedesktop.org
+
+Package: libgstreamer1.0-0
+Architecture: any
+Multi-Arch: same
+Pre-Depends: ${misc:Pre-Depends}
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libcap2-bin [linux-any]
+Suggests: gstreamer1.0-tools,
+Description: Core GStreamer libraries and elements
+ GStreamer is a streaming media framework, based on graphs of filters
+ which operate on media data.  Applications using this library can do
+ anything from real-time sound processing to playing videos, and just
+ about anything else media-related.  Its plugin-based architecture means
+ that new data types or processing capabilities can be added simply by
+ installing new plug-ins.
+ .
+ This package contains the core library and elements.
+
+Package: libgstreamer1.0-dev
+Architecture: any
+Multi-Arch: same
+Section: libdevel
+Depends: libgstreamer1.0-0 (= ${binary:Version}),
+         libc6-dev | libc-dev,
+         pkgconf,
+         libglib2.0-dev,
+         libunwind-dev [i386 amd64 armel armhf arm64 powerpc ppc64 ppc64el mipsel mips64el riscv64],
+         libdw-dev [i386 amd64 armel armhf arm64 powerpc ppc64 ppc64el mipsel mips64el riscv64],
+         ${shlibs:Depends},
+         ${misc:Depends},
+         gir1.2-gstreamer-1.0 (= ${binary:Version})
+Suggests: gstreamer1.0-doc
+Description: GStreamer core development files
+ GStreamer is a streaming media framework, based on graphs of filters
+ which operate on media data.  Applications using this library can do
+ anything from real-time sound processing to playing videos, and just
+ about anything else media-related.  Its plugin-based architecture means
+ that new data types or processing capabilities can be added simply by
+ installing new plug-ins.
+ .
+ This package contains development files for the core library and
+ elements.
+
+Package: gstreamer1.0-tools
+Architecture: any
+Section: utils
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         libgstreamer1.0-0 (>= 1.16.1)
+Suggests: gstreamer1.0-plugins-base
+Description: Tools for use with GStreamer
+ GStreamer is a streaming media framework, based on graphs of filters
+ which operate on media data.  Applications using this library can do
+ anything from real-time sound processing to playing videos, and just
+ about anything else media-related.  Its plugin-based architecture means
+ that new data types or processing capabilities can be added simply by
+ installing new plug-ins.
+ .
+ This package contains versioned command-line tools for GStreamer.
+
+Package: gir1.2-gstreamer-1.0
+Section: introspection
+Architecture: any
+Multi-Arch: same
+Depends: ${gir:Depends},
+         ${shlibs:Depends},
+         ${misc:Depends}
+Description: GObject introspection data for the GStreamer library
+ This package contains introspection data for the GStreamer streaming media
+ framework.
+ .
+ GStreamer is a streaming media framework, based on graphs of filters
+ which operate on media data.  Applications using this library can do
+ anything from real-time sound processing to playing videos, and just
+ about anything else media-related.  Its plugin-based architecture means
+ that new data types or processing capabilities can be added simply by
+ installing new plug-ins.
+ .
+ It can be used by packages using the GIRepository format to generate
+ dynamic bindings.

@@ -1,0 +1,74 @@
+From: Iain Lane <iain.lane@canonical.com>
+Date: Mon, 23 Feb 2015 18:49:31 -0300
+Subject: Add a pkgconfig file to facilitate linking against libgstphotography
+
+Forwarded: not-needed
+---
+ meson.build                            |  1 +
+ pkgconfig/gstreamer-plugins-good.pc.in | 12 ++++++++++++
+ pkgconfig/meson.build                  | 25 +++++++++++++++++++++++++
+ 3 files changed, 38 insertions(+)
+ create mode 100644 pkgconfig/gstreamer-plugins-good.pc.in
+ create mode 100644 pkgconfig/meson.build
+
+diff --git a/meson.build b/meson.build
+index 4d4092f..1eb9577 100644
+--- a/meson.build
++++ b/meson.build
+@@ -489,6 +489,7 @@ gir_init_section = [ '--add-init-section=extern void gst_init(gint*,gchar**);' +
+ 
+ subdir('gst-libs')
+ subdir('gst')
++subdir('pkgconfig')
+ subdir('sys')
+ subdir('ext')
+ subdir('tests')
+diff --git a/pkgconfig/gstreamer-plugins-good.pc.in b/pkgconfig/gstreamer-plugins-good.pc.in
+new file mode 100644
+index 0000000..cab8003
+--- /dev/null
++++ b/pkgconfig/gstreamer-plugins-good.pc.in
+@@ -0,0 +1,12 @@
++prefix=@prefix@
++exec_prefix=@exec_prefix@
++libdir=@libdir@
++includedir=@includedir@/gstreamer-@GST_API_VERSION@
++pluginsdir=@libdir@/gstreamer-@GST_API_VERSION@
++
++Name: GStreamer Good Plugin libraries
++Description: Currently includes the photography interface library
++Requires: gstreamer-@GST_API_VERSION@ gstreamer-base-@GST_API_VERSION@
++Version: @VERSION@
++Libs: -L${libdir} -lgstphotography-@GST_API_VERSION@
++Cflags: -I${includedir}
+diff --git a/pkgconfig/meson.build b/pkgconfig/meson.build
+new file mode 100644
+index 0000000..5ef99bb
+--- /dev/null
++++ b/pkgconfig/meson.build
+@@ -0,0 +1,25 @@
++pkgconf = configuration_data()
++
++pkgconf.set('prefix', join_paths(get_option('prefix')))
++pkgconf.set('exec_prefix', '${prefix}')
++pkgconf.set('libdir', '${prefix}/@0@'.format(get_option('libdir')))
++pkgconf.set('includedir', '${prefix}/@0@'.format(get_option('includedir')))
++pkgconf.set('GST_API_VERSION', api_version)
++pkgconf.set('VERSION', gst_version)
++
++pkg_install_dir = '@0@/pkgconfig'.format(get_option('libdir'))
++
++pkg_libs = [
++  'plugins-good',
++]
++
++foreach p : pkg_libs
++  infile = 'gstreamer-@0@.pc.in'.format(p)
++  outfile = 'gstreamer-@0@-@1@.pc'.format(p, api_version)
++  configure_file(input : infile,
++    output : outfile,
++    configuration : pkgconf,
++    install_dir : pkg_install_dir)
++
++endforeach
++

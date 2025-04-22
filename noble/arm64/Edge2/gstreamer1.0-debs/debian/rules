@@ -1,0 +1,83 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/default.mk
+
+export HOME=$(CURDIR)/fake-home
+
+# debian package version
+version=$(shell dpkg-parsechangelog | grep ^Version: | cut -d ' ' -f 2)
+# upstream version
+gst_version=$(shell echo $(version) | cut -d '-' -f 1)
+
+CFLAGS += -Wno-error
+CXXFLAGS += -Wno-error
+LDFLAGS += -Wl,-z,defs -Wl,-O1
+
+# Let's decide the package name and url depending on the distribution
+DISTRO = "$(shell dpkg-vendor --query vendor)"
+
+GST_PACKAGE_NAME := "GStreamer (unknown Debian derivative)"
+GST_PACKAGE_ORIGIN="https://tracker.debian.org/pkg/gstreamer1.0"
+
+ifeq ($(DISTRO),"Debian")
+GST_PACKAGE_NAME := "GStreamer (Debian)"
+GST_PACKAGE_ORIGIN="https://tracker.debian.org/pkg/gstreamer1.0"
+endif
+
+ifeq ($(DISTRO),"Ubuntu")
+GST_PACKAGE_NAME := "GStreamer (Ubuntu)"
+GST_PACKAGE_ORIGIN="https://launchpad.net/ubuntu/+source/gstreamer1.0"
+endif
+
+conf_flags = --libexecdir=lib/$(DEB_HOST_MULTIARCH)/gstreamer1.0
+conf_flags += -Dpackage-name=$(GST_PACKAGE_NAME) -Dpackage-origin=$(GST_PACKAGE_ORIGIN)
+conf_flags += -Dauto_features=enabled -Ddbghelp=disabled -Ddoc=disabled -Dexamples=disabled
+
+ifeq ($(DEB_HOST_ARCH_OS),linux)
+conf_flags += -Dptp-helper-permissions=capabilities
+else
+conf_flags += -Dptp-helper-permissions=setuid-root \
+	-Dptp-helper-setuid-user=nobody -Dptp-helper-setuid-group=nobody
+endif
+
+ifeq (,$(filter $(DEB_HOST_ARCH),i386 amd64 armel armhf arm64 powerpc ppc64 ppc64el mipsel mips64el riscv64))
+conf_flags += -Dlibunwind=disabled -Dlibdw=disabled
+endif
+
+infiles := \
+	libgstreamer1.0-0.postinst
+
+%:
+	dh $@
+
+# Drop the libexecdir override when we're not in a Freeze?
+# May need rebuilds or code changes to other packages to adapt
+override_dh_auto_configure:
+	dh_auto_configure -- $(conf_flags)
+
+execute_before_dh_auto_clean:
+	rm -rf $(CURDIR)/fake-home
+	set -e; for file in $(infiles); do \
+		rm -f debian/$$file; \
+	done
+
+execute_after_dh_auto_install:
+	gcc -o debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/gstreamer1.0/gstreamer-1.0/gst-codec-info-1.0 -Wall debian/gst-codec-info.c $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) `pkg-config --libs --cflags glib-2.0 gthread-2.0 gmodule-no-export-2.0 gobject-2.0` debian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/libgstreamer-1.0.so -Idebian/tmp/usr/include/gstreamer-1.0 -Idebian/tmp/usr/lib/$(DEB_HOST_MULTIARCH)/gstreamer-1.0/include
+	perldoc -o man debian/dh_gstscancodecs > debian/tmp/usr/share/man/man1/dh_gstscancodecs.1
+
+# Only make the tests fail for key architectures
+override_dh_auto_test:
+ifneq (,$(filter $(DEB_HOST_ARCH), amd64 arm64))
+	dh_auto_test
+else
+	dh_auto_test || true
+endif
+
+override_dh_makeshlibs:
+	dh_makeshlibs -plibgstreamer1.0-0 -X "/usr/lib/$(DEB_HOST_MULTIARCH)/gstreamer-1.0" -V 'libgstreamer1.0-0 (>= $(gst_version))' -- -c4
+
+execute_after_dh_install:
+	set -e; for file in $(infiles); do \
+		sed -e"s/@MULTIARCH@/$(DEB_HOST_MULTIARCH)/g" \
+		debian/$${file}.in > debian/$$file; \
+	done
